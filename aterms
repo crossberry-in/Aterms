@@ -1,0 +1,278 @@
+#!/bin/bash
+
+# --- Configuration ---
+PROJECT_DIR="$HOME/Aterms"
+BINARY_NAME="aterms"
+GO_VERSION="1.22"
+
+echo "🔧 Installing Required Packages..."
+# Ensure the package manager commands are appropriate for the target environment (e.g., Termux)
+# For standard Linux, you might use 'sudo apt install golang wget -y'
+pkg install golang -y
+pkg install wget -y
+
+echo "📁 Creating project directory: $PROJECT_DIR"
+mkdir -p "$PROJECT_DIR"
+cd "$PROJECT_DIR"
+
+# --- 1. Setup Go Module and Dependencies ---
+echo "📝 Creating go.mod"
+cat > go.mod <<EOF
+module aterms
+
+go $GO_VERSION
+
+require (
+    github.com/creack/pty v1.1.24
+    github.com/gorilla/websocket v1.5.3
+)
+EOF
+
+# --- 2. Setup Password File ---
+echo "🔐 Setup password (one-time)"
+if [ ! -f .env ]; then
+    read -p "Enter Password (e.g., 12345): " pass
+    echo "PASSWORD=$pass" > .env
+    echo "🔐 Password saved to .env"
+else
+    echo "🔐 .env file with password already exists"
+fi
+
+# --- 3. Create Go Server Code ---
+echo "📝 Creating main.go"
+cat > main.go <<'EOF'
+package main
+
+import (
+	"log"
+	"net/http"
+	"os"
+	"os/exec"
+
+	"github.com/creack/pty"
+	"github.com/gorilla/websocket"
+)
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true }, // Allow all origins for simplicity
+}
+
+func wsHandler(w http.ResponseWriter, r *http.Request) {
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Println("websocket upgrade error:", err)
+		return
+	}
+	defer ws.Close()
+
+	// Determine the shell to run (defaults to /bin/sh if $SHELL is empty)
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/sh"
+	}
+
+	// Start the shell process with a pseudo-terminal (pty)
+	cmd := exec.Command(shell)
+	ptyFile, err := pty.Start(cmd)
+	if err != nil {
+		log.Println("pty start error:", err)
+		return
+	}
+	defer ptyFile.Close()
+
+	// --- PTY (Shell Output) → WebSocket (Browser Input) ---
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, err := ptyFile.Read(buf)
+			if err != nil {
+				// Close the websocket if PTY read fails (e.g., shell exit)
+				ws.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			ws.WriteMessage(websocket.BinaryMessage, buf[:n])
+		}
+	}()
+
+	// --- WebSocket (Browser Output) → PTY (Shell Input) ---
+	for {
+		// Read data from the websocket
+		_, data, err := ws.ReadMessage()
+		if err != nil {
+			// If websocket read fails (e.g., browser disconnects), exit the loop
+			return
+		}
+		// Write the received data to the shell's input
+		ptyFile.Write(data)
+	}
+}
+
+func main() {
+	// Serve static files from the ./static directory
+	http.Handle("/", http.FileServer(http.Dir("./static")))
+	// Handle WebSocket connections
+	http.HandleFunc("/ws", wsHandler)
+
+	log.Println("Server running on http://localhost:8080. Press CTRL+C to stop.")
+	// Start the HTTP server
+	http.ListenAndServe(":8080", nil)
+}
+EOF
+
+# --- 4. Create Static Assets Directory ---
+echo "📁 Creating static files directories..."
+mkdir -p static/lib
+mkdir -p static/css
+
+# --- 5. Create index.html (the entry page) ---
+cat > static/index.html <<'EOF'
+<!DOCTYPE html><html><body style="margin:0">
+<iframe src="term.html" style="width:100%;height:100vh;border:none"></iframe>
+</body></html>
+EOF
+
+# --- 6. Create term.html (the terminal client with CORRECTED relative paths) ---
+echo "📝 Creating term.html with corrected paths"
+cat > static/term.html <<'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Secure Terminal</title>
+
+<link rel="stylesheet" href="css/xterm.css">
+<script src="lib/xterm.js"></script>
+<script src="lib/xterm-addon-fit.js"></script>
+
+<style>
+html, body {
+    height: 100%;
+    margin: 0;
+    background: #000;
+    color: #fff;
+    font-family: Arial;
+}
+
+#loginBox {
+    position: absolute;
+    top: 40%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: #111;
+    padding: 20px 30px;
+    border-radius: 10px;
+    box-shadow: 0 0 20px #0ff;
+}
+
+#terminal {
+    width: 100%;
+    height: 100%;
+    display: none; /* hidden until login */
+}
+input {
+    width: 200px;
+    padding: 8px;
+    background: #222;
+    border: 1px solid #444;
+    color: #0ff;
+}
+button {
+    padding: 8px 15px;
+}
+</style>
+</head>
+<body>
+
+<div id="loginBox">
+    <h3>Enter Terminal Password</h3>
+    <input type="password" id="pass"><br><br>
+    <button onclick="login()">Login</button>
+    <p id="msg" style="color:red;"></p>
+</div>
+
+<div id="terminal"></div>
+
+<script>
+function login() {
+    const p = document.getElementById('pass').value;
+
+    // !! WARNING: This is client-side validation and is INSECURE !!
+    // Replace "12345" with the password you set in the .env file if you wish to test.
+    if (p !== "12345") { 
+        document.getElementById("msg").innerText = "Incorrect Password!";
+        return;
+    }
+
+    // Hide login
+    document.getElementById('loginBox').style.display = "none";
+
+    // Show terminal
+    document.getElementById('terminal').style.display = "block";
+
+    startTerminal();
+}
+
+function startTerminal() {
+
+    const term = new Terminal({
+        cursorBlink: true,
+        scrollback: 2000,
+        fontFamily: "Monaco, 'Fira Code', monospace",
+        fontSize: 15,
+        theme: {
+            background: "#000000",
+            foreground: "#00ffe7"
+        }
+    });
+
+    const fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+
+    term.open(document.getElementById('terminal'));
+    fit.fit();
+    term.focus();
+
+    // Connect to the Go server's WebSocket endpoint
+    const ws = new WebSocket("ws://" + location.host + "/ws");
+    ws.binaryType = "arraybuffer";
+
+    // Receive data from the shell and write to the terminal
+    ws.onmessage = e => {
+        const msg = new TextDecoder().decode(new Uint8Array(e.data));
+        term.write(msg);
+    };
+
+    // Send data from the terminal to the shell's input
+    term.onData(data => {
+        ws.send(data);
+    });
+}
+</script>
+
+</body>
+</html>
+EOF
+
+# --- 7. Download External Libraries ---
+echo "📦 Downloading Xterm.js libraries..."
+# The -O flag ensures the files are saved with the specified names/paths
+wget -q https://cdn.jsdelivr.net/npm/xterm/lib/xterm.js -O static/lib/xterm.js
+wget -q https://cdn.jsdelivr.net/npm/xterm-addon-fit/lib/xterm-addon-fit.js -O static/lib/xterm-addon-fit.js
+wget -q https://cdn.jsdelivr.net/npm/xterm/css/xterm.css -O static/css/xterm.css
+
+# --- 8. Build and Install ---
+echo "⚙ Building Aterms binary..."
+# Downloads dependencies and compiles the main.go file into an executable named 'main'
+go build main.go
+
+echo "🚚 Installing as global command: $BINARY_NAME"
+# Create the binary directory if it doesn't exist
+mkdir -p "$PREFIX/bin"
+# Copy the compiled binary to the global path
+cp main "$PREFIX/bin/$BINARY_NAME"
+chmod +x "$PREFIX/bin/$BINARY_NAME"
+
+echo "✅ Installation complete!"
+echo "---"
+echo "To run the server, use the command: $BINARY_NAME"
+echo "Then open your browser to: http://localhost:8080/"
